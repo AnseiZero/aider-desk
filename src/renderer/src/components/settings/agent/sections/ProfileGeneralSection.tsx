@@ -281,6 +281,22 @@ export const ProfileGeneralSection = ({ profile, settings, onSettingChange }: Pr
         </div>
       </div>
 
+        <div className="border-t border-border-default-dark pt-4">
+        <div className="text-sm font-medium text-text-primary mb-3">Hybrid Mode</div>
+        <div className="space-y-2">
+          <Checkbox
+            label={
+              <div className="flex items-center">
+                <span>Hybrid Agent Mode</span>
+                <InfoIcon className="ml-1" tooltip="Adds a Planner → Executor → Debugger → Critic orchestration layer. Planner produces a structured plan before execution. Thrash detection stops the agent if the same command repeats 3+ times. Debugger prompt injected on tool failure. Default off — stock Agent behavior unchanged." />
+              </div>
+            }
+            checked={(profile as AgentProfile & { hybridMode?: boolean }).hybridMode === true}
+            onChange={(checked) => onSettingChange('hybridMode' as keyof AgentProfile, checked as AgentProfile[keyof AgentProfile])}
+          />
+        </div>
+      </div>
+
       <div className="border-t border-border-default-dark pt-4">
         <div className="text-sm font-medium text-text-primary mb-3">{t('settings.agent.context')}</div>
         <div className="space-y-2">
