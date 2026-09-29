@@ -90,8 +90,6 @@ import { ExtensionManager } from '@/extensions/extension-manager';
 import {
   isHybridMode,
   buildPlannerSystemPrompt,
-  buildProgressCheckPrompt,
-  buildBudgetLine,
   TraceLogger,
   ExperienceStore,
 } from '@/agent/hybrid/hybrid-runner';
@@ -582,7 +580,7 @@ export class Agent {
         // Retrieve relevant past experiences (plain retrieval, no scoring)
         const experiences = experienceStore.retrieve(prompt);
         const experienceContext = experienceStore.formatAsContext(experiences);
-        let plannerPrompt = buildPlannerSystemPrompt(prompt);
+        let plannerPrompt = buildPlannerSystemPrompt(prompt, 0, profile.maxIterations || 100);
         if (experienceContext) {
           plannerPrompt = `${plannerPrompt}\n\n${experienceContext}`;
         }
@@ -1043,7 +1041,13 @@ export class Agent {
               retryCount = 0;
             }
 
-            // ── Hybrid mode: trace logging + progress check + budget ──
+            // ── Hybrid mode: trace logging + experience recording ──────
+            // NOTE: no per-iteration prompt injection. Injecting user-role
+            // messages for progress checks/budget caused an infinite loop —
+            // AiderDesk's loop treats a trailing user message as "new input
+            // arrived, keep going", so the agent would say "Complete." then
+            // be forced to respond again, forever. Completion verification
+            // and budget awareness live in the system prompt instead.
             if (isHybrid && traceLogger) {
               const toolCalls = stepResult.toolCalls || [];
               const toolResults = stepResult.toolResults || [];
@@ -1062,34 +1066,6 @@ export class Agent {
                   outputSummary: toolOutput.slice(0, 200),
                   isError,
                 });
-              }
-
-              // LLM-as-judge progress check every 5 rounds
-              const progressCheck = buildProgressCheckPrompt(
-                toolCalls.map((tc, i) => ({
-                  tool: tc.toolName,
-                  summary: (toolResults[i]?.output ? String(toolResults[i].output) : '').slice(0, 100),
-                })),
-                iterationCount,
-                profile.maxIterations,
-              );
-              if (progressCheck) {
-                currentStepMessages.push({
-                  role: 'user' as const,
-                  content: progressCheck,
-                  id: `progress-check-${uuidv4()}`,
-                } as ContextMessage);
-                logger.info(`[hybrid] Progress check injected at iteration ${iterationCount}`);
-              }
-
-              // Budget as context (not enforcement)
-              const budgetLine = buildBudgetLine(iterationCount, profile.maxIterations || 100);
-              if (budgetLine) {
-                currentStepMessages.push({
-                  role: 'user' as const,
-                  content: budgetLine,
-                  id: `budget-${uuidv4()}`,
-                } as ContextMessage);
               }
 
               // Record experience outcomes (plain storage for retrieval)

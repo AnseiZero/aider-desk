@@ -21,7 +21,21 @@ import * as path from 'path';
 
 // ── Planner pass ────────────────────────────────────────────────────────
 
-export function buildPlannerSystemPrompt(userMessage: string): string {
+export function buildPlannerSystemPrompt(userMessage: string, currentIteration?: number, maxIterations?: number): string {
+  const budgetSection: string[] = [];
+  if (typeof currentIteration === 'number' && typeof maxIterations === 'number' && maxIterations > 0) {
+    const usage = Math.round((currentIteration / maxIterations) * 100);
+    if (usage >= 50) {
+      budgetSection.push(
+        '',
+        '## Budget Awareness',
+        `You have used ${currentIteration}/${maxIterations} steps (${usage}%). ${maxIterations - currentIteration} remaining.`,
+        'Factor this into your continue/stop decisions. Prioritize completing the most important remaining steps.',
+        'If you cannot complete the task within the remaining budget, state clearly what is done and what is not.',
+      );
+    }
+  }
+
   return [
     '# HYBRID PLANNER PASS',
     '',
@@ -58,6 +72,14 @@ export function buildPlannerSystemPrompt(userMessage: string): string {
     'explain why you cannot proceed further.',
     'Do NOT claim completion without evidence. Do NOT mark remaining steps as done.',
     '',
+    '## Progress Self-Check (every ~5 steps):',
+    'Periodically review your recent tool calls and ask yourself:',
+    '- Has meaningful progress happened (new information, artifacts, task advance)?',
+    '- Or am I repeating myself (same ground, similar outputs)?',
+    'If genuinely stalled after multiple checks, stop and ask the user for direction.',
+    'Do not keep producing "Complete." or "Done." responses — either call tools',
+    'to make progress or stop cleanly. Repeating completion claims wastes budget.',
+    '',
     '## Human Escalation Points (ALWAYS stop and ask the user):',
     '- Irreversible file operations: rm -rf, force push, deleting important files',
     '- Anything touching production or external services (deploying, sending emails, modifying shared resources)',
@@ -67,60 +89,8 @@ export function buildPlannerSystemPrompt(userMessage: string): string {
     '',
     '## Task:',
     userMessage,
+    ...budgetSection,
   ].join('\n');
-}
-
-// ── LLM-as-judge progress check ────────────────────────────────────────
-
-const PROGRESS_CHECK_INTERVAL = 5; // every N tool-call rounds
-
-/**
- * Build a lightweight progress-check prompt injected every N rounds.
- * The model (same executor model, no separate call) self-evaluates:
- * "has meaningful progress happened?" — semantic judgment, not regex.
- */
-export function buildProgressCheckPrompt(
-  recentSteps: Array<{ tool: string; summary: string }>,
-  currentIteration: number,
-  maxIterations: number,
-): string | null {
-  if (recentSteps.length < PROGRESS_CHECK_INTERVAL) return null;
-
-  const stepSummary = recentSteps
-    .slice(-PROGRESS_CHECK_INTERVAL)
-    .map((s, i) => `${i + 1}. ${s.tool}: ${s.summary.slice(0, 100)}`)
-    .join('\n');
-
-  return [
-    '# PROGRESS CHECK (internal — do not show to user)',
-    '',
-    `You are at iteration ${currentIteration} of ${maxIterations}.`,
-    `Recent steps:`,
-    stepSummary,
-    '',
-    'Evaluate: has meaningful progress happened in these steps?',
-    '- "real": new information was discovered, artifacts were created, or the task advanced.',
-    '- "stalled": the same ground was covered, outputs were similar, or you are repeating yourself.',
-    '',
-    'If stalled, state what you will do differently (new tool, new target, new method).',
-    'If real, continue with the next step.',
-    '',
-    'This check is advisory — use it to steer, not to stop. If genuinely stalled after',
-    'multiple stalled checks, consider stopping and asking the user for direction.',
-  ].join('\n');
-}
-
-// ── Budget in context ───────────────────────────────────────────────────
-
-/**
- * Compact budget line for the executor context — put it in the prompt,
- * let the model/Critic reason about it. No enforcement code.
- */
-export function buildBudgetLine(currentIteration: number, maxIterations: number): string | null {
-  if (maxIterations <= 0) return null;
-  const usage = Math.round((currentIteration / maxIterations) * 100);
-  if (usage < 50) return null;
-  return `Budget: ${currentIteration}/${maxIterations} steps used (${usage}%). ${maxIterations - currentIteration} remaining. Factor this into continue/stop decisions.`;
 }
 
 // ── Trace logging ───────────────────────────────────────────────────────
