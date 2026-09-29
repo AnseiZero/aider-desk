@@ -1,5 +1,5 @@
-appId: com.hotovo.aider-desk
-productName: aider-desk
+appId: com.local.aider-desk-hybrid
+productName: aider-desk-hybrid
 directories:
   buildResources: build
 files:
