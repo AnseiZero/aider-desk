@@ -88,11 +88,12 @@ import { AgentProfileManager } from '@/agent/agent-profile-manager';
 import { McpConfigManager } from '@/agent/mcp-config-manager';
 import { ExtensionManager } from '@/extensions/extension-manager';
 import {
-  createHybridLoopState,
   isHybridMode,
   buildPlannerSystemPrompt,
-
-  checkHybridState,
+  buildProgressCheckPrompt,
+  buildBudgetLine,
+  TraceLogger,
+  ExperienceStore,
 } from '@/agent/hybrid/hybrid-runner';
 
 const MAX_RETRIES = 3;
@@ -560,18 +561,34 @@ export class Agent {
         let contextMessages = initialContextMessages ?? (await task.getContextMessages());
     let contextFiles = initialContextFiles ?? (await task.getContextFiles());
 
-    // ── Hybrid mode: planner pass + thrash/debugger state ──────────
-    const hybridState = createHybridLoopState();
-    const isHybrid = isHybridMode(profile);
-    if (isHybrid && prompt) {
-      // Inject the planner prompt into the system prompt for hybrid mode.
-      // The model will produce a plan and immediately begin Step 1.
-      systemPrompt = `${systemPrompt}\n\n${buildPlannerSystemPrompt(prompt)}`;
-      logger.info('[hybrid] Planner pass injected into system prompt');
-    }
-
+    // ── Load the system prompt FIRST (always, both modes) ─────────────
+    // This loads the base system prompt + rules + custom instructions.
+    // Rules MUST be included whether hybrid mode is on or off.
     if (!systemPrompt) {
       systemPrompt = await this.promptsManager.getSystemPrompt(this.store.getSettings(), task, profile);
+    }
+
+    // ── Hybrid mode: planner pass ─────────────────────────────────────
+    // Appended AFTER the base system prompt (which includes rules) so
+    // rules are never skipped or overridden.
+    const isHybrid = isHybridMode(profile);
+    let traceLogger: TraceLogger | null = null;
+    let experienceStore: ExperienceStore | null = null;
+    if (isHybrid) {
+      traceLogger = new TraceLogger();
+      traceLogger.start(task.taskId);
+      experienceStore = new ExperienceStore();
+      if (prompt) {
+        // Retrieve relevant past experiences (plain retrieval, no scoring)
+        const experiences = experienceStore.retrieve(prompt);
+        const experienceContext = experienceStore.formatAsContext(experiences);
+        let plannerPrompt = buildPlannerSystemPrompt(prompt);
+        if (experienceContext) {
+          plannerPrompt = `${plannerPrompt}\n\n${experienceContext}`;
+        }
+        systemPrompt = `${systemPrompt}\n\n${plannerPrompt}`;
+        logger.info(`[hybrid] Planner pass injected (${experiences.length} past experiences retrieved)`);
+      }
     }
 
     const settings = this.store.getSettings();
@@ -1026,48 +1043,70 @@ export class Agent {
               retryCount = 0;
             }
 
-            // ── Hybrid mode: thrash detection + debugger injection ──
-            if (isHybrid) {
+            // ── Hybrid mode: trace logging + progress check + budget ──
+            if (isHybrid && traceLogger) {
               const toolCalls = stepResult.toolCalls || [];
               const toolResults = stepResult.toolResults || [];
 
               for (let i = 0; i < toolCalls.length; i++) {
                 const tc = toolCalls[i];
                 const tr = toolResults[i];
-                const toolError = tr?.output ? String(tr.output) : null;
-                const hasError = toolError && (
-                  /error|failed|failure|fatal|traceback|exception|EACCES|ENOENT|ECONNREFUSED|ETIMEDOUT/i.test(toolError)
-                );
+                const toolOutput = tr?.output ? String(tr.output) : '';
+                const isError = /error|failed|failure|fatal|traceback|exception|EACCES|ENOENT|ECONNREFUSED|ETIMEDOUT/i.test(toolOutput);
 
-                const hybridResult = checkHybridState(
-                  hybridState,
-                  tc.toolName,
-                  (tc.input as Record<string, unknown>) || {},
-                  hasError ? toolError : null,
-                );
+                traceLogger.log({
+                  timestamp: Date.now(),
+                  iteration: iterationCount,
+                  tool: tc.toolName,
+                  argsSummary: JSON.stringify(tc.input || {}).slice(0, 100),
+                  outputSummary: toolOutput.slice(0, 200),
+                  isError,
+                });
+              }
 
-                if (hybridResult.shouldStop) {
-                  logger.warn(`[hybrid] Thrash stop: ${hybridResult.stopReason}`);
-                  task.addLogMessage(
-                    'warning',
-                    hybridResult.stopReason!,
-                    false,
-                    promptContext,
-                  );
-                  // Force the loop to exit by making finishReason non-tool-calls
-                  finishReason = 'stop';
-                  break;
-                }
+              // LLM-as-judge progress check every 5 rounds
+              const progressCheck = buildProgressCheckPrompt(
+                toolCalls.map((tc, i) => ({
+                  tool: tc.toolName,
+                  summary: (toolResults[i]?.output ? String(toolResults[i].output) : '').slice(0, 100),
+                })),
+                iterationCount,
+                profile.maxIterations,
+              );
+              if (progressCheck) {
+                currentStepMessages.push({
+                  role: 'user' as const,
+                  content: progressCheck,
+                  id: `progress-check-${uuidv4()}`,
+                } as ContextMessage);
+                logger.info(`[hybrid] Progress check injected at iteration ${iterationCount}`);
+              }
 
-                if (hybridResult.debugPrompt) {
-                  // Inject debugger prompt as a system instruction into the next turn
-                  currentStepMessages.push({
-                    role: 'user' as const,
-                    content: hybridResult.debugPrompt,
-                    id: `debugger-${uuidv4()}`,
-                  } as ContextMessage);
-                  logger.info(`[hybrid] Debugger prompt injected for tool: ${tc.toolName}`);
-                }
+              // Budget as context (not enforcement)
+              const budgetLine = buildBudgetLine(iterationCount, profile.maxIterations || 100);
+              if (budgetLine) {
+                currentStepMessages.push({
+                  role: 'user' as const,
+                  content: budgetLine,
+                  id: `budget-${uuidv4()}`,
+                } as ContextMessage);
+              }
+
+              // Record experience outcomes (plain storage for retrieval)
+              if (experienceStore && toolCalls.length > 0) {
+                const lastTool = toolCalls[toolCalls.length - 1];
+                const lastResult = toolResults[toolResults.length - 1];
+                const lastOutput = lastResult?.output ? String(lastResult.output) : '';
+                const isError = /error|failed|failure|fatal|traceback|exception/i.test(lastOutput);
+                experienceStore.record({
+                  taskSummary: prompt?.slice(0, 120) || 'unknown task',
+                  tool: lastTool.toolName,
+                  approach: JSON.stringify(lastTool.input || {}).slice(0, 80),
+                  outcome: isError ? 'failure' : 'success',
+                  lesson: isError
+                    ? `Tool ${lastTool.toolName} failed: ${lastOutput.slice(0, 80)}`
+                    : `Tool ${lastTool.toolName} succeeded: ${lastOutput.slice(0, 80)}`,
+                });
               }
             }
           } catch (error) {
