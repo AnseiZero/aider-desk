@@ -87,6 +87,13 @@ import { createSubagentsToolset } from '@/agent/tools/subagents';
 import { AgentProfileManager } from '@/agent/agent-profile-manager';
 import { McpConfigManager } from '@/agent/mcp-config-manager';
 import { ExtensionManager } from '@/extensions/extension-manager';
+import {
+  createHybridLoopState,
+  isHybridMode,
+  buildPlannerSystemPrompt,
+
+  checkHybridState,
+} from '@/agent/hybrid/hybrid-runner';
 
 const MAX_RETRIES = 3;
 
@@ -550,8 +557,18 @@ export class Agent {
     images?: string[],
     skillsToActivate?: string[],
   ): Promise<ContextMessage[]> {
-    let contextMessages = initialContextMessages ?? (await task.getContextMessages());
+        let contextMessages = initialContextMessages ?? (await task.getContextMessages());
     let contextFiles = initialContextFiles ?? (await task.getContextFiles());
+
+    // ── Hybrid mode: planner pass + thrash/debugger state ──────────
+    const hybridState = createHybridLoopState();
+    const isHybrid = isHybridMode(profile);
+    if (isHybrid && prompt) {
+      // Inject the planner prompt into the system prompt for hybrid mode.
+      // The model will produce a plan and immediately begin Step 1.
+      systemPrompt = `${systemPrompt}\n\n${buildPlannerSystemPrompt(prompt)}`;
+      logger.info('[hybrid] Planner pass injected into system prompt');
+    }
 
     if (!systemPrompt) {
       systemPrompt = await this.promptsManager.getSystemPrompt(this.store.getSettings(), task, profile);
@@ -1007,6 +1024,51 @@ export class Agent {
             if (currentStepMessages.length > 0) {
               // Reset retry count when we get a response
               retryCount = 0;
+            }
+
+            // ── Hybrid mode: thrash detection + debugger injection ──
+            if (isHybrid) {
+              const toolCalls = stepResult.toolCalls || [];
+              const toolResults = stepResult.toolResults || [];
+
+              for (let i = 0; i < toolCalls.length; i++) {
+                const tc = toolCalls[i];
+                const tr = toolResults[i];
+                const toolError = tr?.output ? String(tr.output) : null;
+                const hasError = toolError && (
+                  /error|failed|failure|fatal|traceback|exception|EACCES|ENOENT|ECONNREFUSED|ETIMEDOUT/i.test(toolError)
+                );
+
+                const hybridResult = checkHybridState(
+                  hybridState,
+                  tc.toolName,
+                  (tc.input as Record<string, unknown>) || {},
+                  hasError ? toolError : null,
+                );
+
+                if (hybridResult.shouldStop) {
+                  logger.warn(`[hybrid] Thrash stop: ${hybridResult.stopReason}`);
+                  task.addLogMessage(
+                    'warning',
+                    hybridResult.stopReason!,
+                    false,
+                    promptContext,
+                  );
+                  // Force the loop to exit by making finishReason non-tool-calls
+                  finishReason = 'stop';
+                  break;
+                }
+
+                if (hybridResult.debugPrompt) {
+                  // Inject debugger prompt as a system instruction into the next turn
+                  currentStepMessages.push({
+                    role: 'user' as const,
+                    content: hybridResult.debugPrompt,
+                    id: `debugger-${uuidv4()}`,
+                  } as ContextMessage);
+                  logger.info(`[hybrid] Debugger prompt injected for tool: ${tc.toolName}`);
+                }
+              }
             }
           } catch (error) {
             // The AI SDK swallows errors thrown in onStepEnd callbacks, so
